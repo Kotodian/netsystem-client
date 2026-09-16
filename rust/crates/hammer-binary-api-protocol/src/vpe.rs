@@ -5,21 +5,28 @@ use serde::{Deserialize, Serialize};
 use crate::api::{Api, Block, Field, Service, name_crc};
 use crate::value::FixedString;
 
-const fn primitive(name: &'static str, field_type: &'static str, length: usize) -> Field {
+const fn scalar(name: &'static str, field_type: &'static str) -> Field {
     Field {
         name,
         field_type,
+        block: None,
+        length: None,
+        length_field: None,
+    }
+}
+
+const fn string(name: &'static str, length: usize) -> Field {
+    Field {
+        name,
+        field_type: "string",
         block: None,
         length: Some(length),
         length_field: None,
     }
 }
 
-const SHOW_VERSION_BLOCK: Block = Block::Fields(&[
-    primitive("id", "u16", 1),
-    primitive("client_index", "u32", 1),
-    primitive("context", "u32", 1),
-]);
+const SHOW_VERSION_BLOCK: Block =
+    Block::Fields(&[scalar("client_index", "u32"), scalar("context", "u32")]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShowVersion {
@@ -59,13 +66,12 @@ impl Api for ShowVersion {
 }
 
 const SHOW_VERSION_REPLY_BLOCK: Block = Block::Fields(&[
-    primitive("id", "u16", 1),
-    primitive("context", "u32", 1),
-    primitive("retval", "i32", 1),
-    primitive("program", "string", 32),
-    primitive("version", "string", 32),
-    primitive("build_date", "string", 32),
-    primitive("build_directory", "string", 256),
+    scalar("context", "u32"),
+    scalar("retval", "i32"),
+    string("program", 32),
+    string("version", 32),
+    string("build_date", 32),
+    string("build_directory", 256),
 ]);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

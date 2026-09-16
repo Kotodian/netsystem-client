@@ -9,3 +9,6 @@ publish.workspace = true
 hammer-binary-api-client = { path = "../hammer-binary-api-client" }
 hammer-binary-api-protocol = { path = "../hammer-binary-api-protocol" }
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

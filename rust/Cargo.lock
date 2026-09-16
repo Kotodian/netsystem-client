@@ -45,6 +45,7 @@ dependencies = [
  "hammer-binary-api-client",
  "hammer-binary-api-protocol",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

@@ -11,7 +11,17 @@ use crate::value::FixedString;
 pub const MEMCLNT_CREATE_V2_ID: u16 = 25;
 pub const MEMCLNT_CREATE_V2_REPLY_ID: u16 = 26;
 
-const fn primitive(name: &'static str, field_type: &'static str, length: usize) -> Field {
+const fn scalar(name: &'static str, field_type: &'static str) -> Field {
+    Field {
+        name,
+        field_type,
+        block: None,
+        length: None,
+        length_field: None,
+    }
+}
+
+const fn array(name: &'static str, field_type: &'static str, length: usize) -> Field {
     Field {
         name,
         field_type,
@@ -21,14 +31,23 @@ const fn primitive(name: &'static str, field_type: &'static str, length: usize) 
     }
 }
 
+const fn string(name: &'static str, length: usize) -> Field {
+    Field {
+        name,
+        field_type: "string",
+        block: None,
+        length: Some(length),
+        length_field: None,
+    }
+}
+
 const CREATE_BLOCK: Block = Block::Fields(&[
-    primitive("id", "u16", 1),
-    primitive("context", "u32", 1),
-    primitive("ctx_quota", "i32", 1),
-    primitive("input_queue", "u64", 1),
-    primitive("name", "string", 64),
-    primitive("api_versions", "u32", 8),
-    primitive("keepalive", "bool", 1),
+    scalar("context", "u32"),
+    scalar("ctx_quota", "i32"),
+    scalar("input_queue", "u64"),
+    string("name", 64),
+    array("api_versions", "u32", 8),
+    scalar("keepalive", "bool"),
 ]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,12 +91,11 @@ impl Api for MemclntCreateV2 {
 }
 
 const CREATE_REPLY_BLOCK: Block = Block::Fields(&[
-    primitive("id", "u16", 1),
-    primitive("context", "u32", 1),
-    primitive("response", "i32", 1),
-    primitive("handle", "u64", 1),
-    primitive("index", "u32", 1),
-    primitive("message_table", "u64", 1),
+    scalar("context", "u32"),
+    scalar("response", "i32"),
+    scalar("handle", "u64"),
+    scalar("index", "u32"),
+    scalar("message_table", "u64"),
 ]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,10 +127,9 @@ impl Api for MemclntCreateV2Reply {
 }
 
 const DELETE_BLOCK: Block = Block::Fields(&[
-    primitive("id", "u16", 1),
-    primitive("index", "u32", 1),
-    primitive("handle", "u64", 1),
-    primitive("do_cleanup", "bool", 1),
+    scalar("index", "u32"),
+    scalar("handle", "u64"),
+    scalar("do_cleanup", "bool"),
 ]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,11 +164,8 @@ impl Api for MemclntDelete {
     }
 }
 
-const DELETE_REPLY_BLOCK: Block = Block::Fields(&[
-    primitive("id", "u16", 1),
-    primitive("response", "i32", 1),
-    primitive("handle", "u64", 1),
-]);
+const DELETE_REPLY_BLOCK: Block =
+    Block::Fields(&[scalar("response", "i32"), scalar("handle", "u64")]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemclntDeleteReply {
@@ -173,11 +187,8 @@ impl Api for MemclntDeleteReply {
     };
 }
 
-const KEEPALIVE_BLOCK: Block = Block::Fields(&[
-    primitive("id", "u16", 1),
-    primitive("client_index", "u32", 1),
-    primitive("context", "u32", 1),
-]);
+const KEEPALIVE_BLOCK: Block =
+    Block::Fields(&[scalar("client_index", "u32"), scalar("context", "u32")]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemclntKeepalive {
@@ -216,11 +227,8 @@ impl Api for MemclntKeepalive {
     }
 }
 
-const KEEPALIVE_REPLY_BLOCK: Block = Block::Fields(&[
-    primitive("id", "u16", 1),
-    primitive("context", "u32", 1),
-    primitive("retval", "i32", 1),
-]);
+const KEEPALIVE_REPLY_BLOCK: Block =
+    Block::Fields(&[scalar("context", "u32"), scalar("retval", "i32")]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemclntKeepaliveReply {

@@ -4,21 +4,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{Api, Block, Field, Service, name_crc};
 
-const fn primitive(name: &'static str, field_type: &'static str) -> Field {
+const fn scalar(name: &'static str, field_type: &'static str) -> Field {
     Field {
         name,
         field_type,
         block: None,
-        length: Some(1),
+        length: None,
         length_field: None,
     }
 }
 
-const CONTROL_PING_BLOCK: Block = Block::Fields(&[
-    primitive("id", "u16"),
-    primitive("client_index", "u32"),
-    primitive("context", "u32"),
-]);
+const CONTROL_PING_BLOCK: Block =
+    Block::Fields(&[scalar("client_index", "u32"), scalar("context", "u32")]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlPing {
@@ -58,11 +55,10 @@ impl Api for ControlPing {
 }
 
 const CONTROL_PING_REPLY_BLOCK: Block = Block::Fields(&[
-    primitive("id", "u16"),
-    primitive("context", "u32"),
-    primitive("retval", "i32"),
-    primitive("client_index", "u32"),
-    primitive("vpe_pid", "u32"),
+    scalar("context", "u32"),
+    scalar("retval", "i32"),
+    scalar("client_index", "u32"),
+    scalar("vpe_pid", "u32"),
 ]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

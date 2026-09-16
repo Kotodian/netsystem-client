@@ -289,12 +289,12 @@ fn probe_backing(backing: &OwnedFd, page_size: usize) -> Result<(usize, usize), 
     if available < page_size {
         return Err(SvmRegionError::NotReady);
     }
-    let mut first_page = vec![0_u8; page_size];
+    let mut header = MaybeUninit::<SvmRegionHeader>::uninit();
     let read = unsafe {
         libc::pread(
             backing.as_raw_fd(),
-            first_page.as_mut_ptr().cast(),
-            first_page.len(),
+            header.as_mut_ptr().cast(),
+            size_of::<SvmRegionHeader>(),
             0,
         )
     };
@@ -306,8 +306,8 @@ fn probe_backing(backing: &OwnedFd, page_size: usize) -> Result<(usize, usize), 
     if read < size_of::<SvmRegionHeader>() as isize {
         return Err(SvmRegionError::NotReady);
     }
-    let header = first_page.as_ptr().cast::<SvmRegionHeader>();
-    let version = unsafe { (*header).version.load(Ordering::Acquire) };
+    let header = unsafe { header.assume_init_ref() };
+    let version = header.version.load(Ordering::Acquire);
     if version == 0 {
         return Err(SvmRegionError::NotReady);
     }
@@ -317,8 +317,8 @@ fn probe_backing(backing: &OwnedFd, page_size: usize) -> Result<(usize, usize), 
             expected: SVM_REGION_VERSION,
         });
     }
-    let base = unsafe { (*header).virtual_base.addr() };
-    let size = unsafe { (*header).virtual_size };
+    let base = header.virtual_base.addr();
+    let size = header.virtual_size;
     if base == 0 || size < page_size || !size.is_multiple_of(page_size) {
         return Err(SvmRegionError::NotReady);
     }
