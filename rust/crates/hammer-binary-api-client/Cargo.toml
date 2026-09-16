@@ -1,0 +1,13 @@
+[package]
+name = "hammer-binary-api-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hammer-binary-api-protocol = { path = "../hammer-binary-api-protocol" }
+hammer-shmem = { path = "../hammer-shmem" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

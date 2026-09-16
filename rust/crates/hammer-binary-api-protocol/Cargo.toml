@@ -1,0 +1,11 @@
+[package]
+name = "hammer-binary-api-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hammer-shmem = { path = "../hammer-shmem" }
+serde.workspace = true
+thiserror.workspace = true

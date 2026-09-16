@@ -1,0 +1,11 @@
+[package]
+name = "hammer-binary-api-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hammer-binary-api-client = { path = "../hammer-binary-api-client" }
+hammer-binary-api-protocol = { path = "../hammer-binary-api-protocol" }
+thiserror.workspace = true
