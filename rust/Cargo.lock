@@ -59,6 +59,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hammer-stats-client"
+version = "0.1.0"
+dependencies = [
+ "hammer-stats-protocol",
+ "libc",
+ "thiserror",
+]
+
+[[package]]
+name = "hammer-stats-protocol"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
