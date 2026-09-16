@@ -2,6 +2,8 @@
 resolver = "3"
 members = [
     "crates/hammer-shmem",
+    "crates/hammer-stats-protocol",
+    "crates/hammer-stats-client",
     "crates/hammer-binary-api-protocol",
     "crates/hammer-binary-api-client",
     "crates/hammer-binary-api-rpc",
