@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hammer_stats_client::{
     BufferPoolStatsProvider, Error, MemoryStatsProvider, MetricValue, NodeCounter,
-    NodeStatsProvider, StatsClient, SystemStatsProvider,
+    NodeErrorStatsProvider, NodeStatsProvider, StatsClient, SystemStatsProvider,
 };
 
 const DAEMON_BINARY: &str = "HAMMER_DAEMON";
@@ -24,6 +24,10 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(300);
 const WORKER_COUNT: u64 = 1;
 /// Worker count of the `/sys` vectors: one column per Data Worker.
 const WORKER_COLUMNS: usize = WORKER_COUNT as usize;
+/// The plugin roots whose nodes declare errors in the server repository: the
+/// ip plugin owns ip4-local/ip4-receive/icmp-error and the icmp plugin the echo
+/// and input nodes.
+const ERROR_PLUGINS: &str = r#"["ip", "icmp"]"#;
 
 struct HammerDaemon {
     child: Child,
@@ -44,6 +48,16 @@ impl HammerDaemon {
     /// Starts a daemon whose `[statseg]` section also carries `statseg_extra`,
     /// for example `per_node_counters = true`.
     fn start_with_config(binary: &Path, statseg_extra: &str) -> Self {
+        Self::start_with_plugins(binary, "[]", statseg_extra)
+    }
+
+    /// Starts a daemon that loads `plugins` as its configured roots.
+    ///
+    /// The server resolves roots next to the daemon executable, which is where
+    /// `cargo build --workspace` leaves the plugin cdylibs. The daemon is a
+    /// foreign binary whose dependencies live beside it, so its own directory
+    /// and `deps/` are placed ahead of any library path this test inherits.
+    fn start_with_plugins(binary: &Path, plugins: &str, statseg_extra: &str) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
@@ -61,7 +75,7 @@ impl HammerDaemon {
         fs::write(
             &config_path,
             format!(
-                "plugins = []\n\n[memory]\nmain_heap_size = \"256 MiB\"\n\n[worker]\ncount = {WORKER_COUNT}\n\n[statseg]\nsocket_name = \"{}\"\nupdate_interval = \"50ms\"\n{statseg_extra}\n[api-segment]\nprefix = \"{prefix}\"\n",
+                "plugins = {plugins}\n\n[memory]\nmain_heap_size = \"256 MiB\"\n\n[worker]\ncount = {WORKER_COUNT}\n\n[statseg]\nsocket_name = \"{}\"\nupdate_interval = \"50ms\"\n{statseg_extra}\n[api-segment]\nprefix = \"{prefix}\"\n",
                 stats_socket.display()
             ),
         )
@@ -427,6 +441,113 @@ fn stats_values_are_published_and_readable() {
         ),
         Err(error) => panic!("an absent family is not an error: {error}"),
     }
+
+    drop(client);
+    let status = daemon.shutdown();
+    assert!(
+        status.success(),
+        "{}",
+        daemon.diagnostics(format!("daemon exits unsuccessfully: {status:?}"))
+    );
+}
+
+/// Whether the error-family plugin cdylibs were built next to the daemon.
+///
+/// `cargo build --workspace` produces them; a daemon pointed at from a bare
+/// build directory may not have them, and the registered-error half must not
+/// silently claim coverage then.
+fn plugin_cdylibs_present(daemon_binary: &Path) -> bool {
+    let directory = daemon_binary
+        .parent()
+        .expect("the daemon binary has a parent directory");
+    ["ip", "icmp"].iter().all(|name| {
+        directory
+            .join(format!("libhammer_plugin_{name}.so"))
+            .exists()
+    })
+}
+
+/// `/err/<node>/<error>`: the node error family as VPP's own client reads it.
+///
+/// A daemon whose nodes declare no errors publishes no `/err` entry at all;
+/// once the ip and icmp plugins are loaded, every registered error is one alias
+/// onto its own column of the server's `/node/errors` vector, with one count per
+/// runtime thread and no collector delay between a record and a read.
+#[test]
+#[ignore = "requires HAMMER_DAEMON=/absolute/path/to/hammer"]
+fn node_error_counters_are_published_and_readable() {
+    let daemon_binary = std::env::var_os(DAEMON_BINARY)
+        .map(PathBuf::from)
+        .expect("HAMMER_DAEMON must name the Hammer daemon binary");
+
+    let mut daemon = HammerDaemon::start(&daemon_binary);
+    let client = daemon.stats_client();
+    let report = match client.report::<NodeErrorStatsProvider>() {
+        Ok(report) => report,
+        Err(error) => panic!("{}", daemon.diagnostics(error)),
+    };
+    assert!(
+        report.is_none(),
+        "a daemon whose nodes declare no errors publishes no `/err` family"
+    );
+    drop(client);
+    let status = daemon.shutdown();
+    assert!(
+        status.success(),
+        "{}",
+        daemon.diagnostics(format!("daemon exits unsuccessfully: {status:?}"))
+    );
+
+    if !plugin_cdylibs_present(&daemon_binary) {
+        eprintln!(
+            "skipping the registered-error half: plugin cdylibs are not next to {}",
+            daemon_binary.display()
+        );
+        return;
+    }
+
+    let mut daemon = HammerDaemon::start_with_plugins(&daemon_binary, ERROR_PLUGINS, "");
+    let client = daemon.stats_client();
+    let errors = match client.report::<NodeErrorStatsProvider>() {
+        Ok(Some(report)) => report,
+        Ok(None) => panic!(
+            "{}",
+            daemon.diagnostics("the loaded plugins declare errors")
+        ),
+        Err(error) => panic!("{}", daemon.diagnostics(error)),
+    };
+
+    // ip4-local owns six errors, and the ip and icmp plugins register eleven
+    // nodes in total; the report carries one entry per (node, error) pair, in
+    // name order.
+    assert_eq!(
+        errors.node("ip4-local").count(),
+        6,
+        "ip4-local publishes its six errors"
+    );
+    let bad_length = errors
+        .error("ip4-local", "bad-length")
+        .expect("ip4-local publishes bad-length");
+    assert_eq!(
+        bad_length.counts.len(),
+        WORKER_COUNT as usize + 1,
+        "one count per runtime thread, thread zero first"
+    );
+
+    let mut nodes: Vec<&str> = errors
+        .errors
+        .iter()
+        .map(|counters| counters.node.as_str())
+        .collect();
+    nodes.dedup();
+    assert!(
+        nodes.contains(&"icmp4-input"),
+        "the icmp plugin's nodes publish errors too: {nodes:?}"
+    );
+    assert!(
+        errors.total() < u64::MAX,
+        "counts are ordinary cumulative counters"
+    );
 
     drop(client);
     let status = daemon.shutdown();

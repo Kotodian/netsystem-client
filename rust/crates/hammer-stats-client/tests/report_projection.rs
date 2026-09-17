@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use hammer_stats_client::{
     BufferPoolStatsProvider, Error, MemoryStatsProvider, MetricValue, NodeCounter,
-    NodeStatsProvider, StatsProvider, StatsReader, SystemStats, SystemStatsProvider,
+    NodeErrorStatsProvider, NodeStatsProvider, StatsProvider, StatsReader, SystemStats,
+    SystemStatsProvider,
 };
 
 /// The family projections only need names and values, so the fixture is a map.
@@ -480,6 +481,158 @@ fn buffer_pool_report_rejects_a_gauge_that_is_not_a_gauge() {
             assert_eq!(name, "/buffer-pools/default-numa-0/cached");
             assert_eq!(expected, "gauge");
             assert_eq!(actual, "counter_vector_simple");
+        }
+        other => panic!("expected a metric-type error, got {other}"),
+    }
+}
+
+/// Two nodes' errors: one node with two errors over two threads, one with a
+/// single error, a name outside the family, and an alias without its error
+/// segment.
+fn error_fixture() -> DirectoryFixture {
+    DirectoryFixture::new([
+        (
+            "/err/ip4-local/bad-length",
+            MetricValue::Simple(vec![vec![3], vec![4]]),
+        ),
+        (
+            "/err/ip4-local/bad-checksum",
+            MetricValue::Simple(vec![vec![1], vec![0]]),
+        ),
+        (
+            "/err/icmp4-input/too-short",
+            MetricValue::Simple(vec![vec![9], vec![9]]),
+        ),
+        ("/error/not-an-alias", MetricValue::Simple(vec![vec![7]])),
+        ("/err/ip4-local", MetricValue::Simple(vec![vec![7]])),
+        ("/sys/heartbeat", MetricValue::Scalar(7)),
+    ])
+}
+
+#[test]
+fn node_error_report_reads_every_alias_in_name_order() {
+    let directory = error_fixture();
+    let report = NodeErrorStatsProvider::report(&directory)
+        .expect("fixture is well formed")
+        .expect("the family is published");
+
+    let pairs: Vec<(&str, &str)> = report
+        .errors
+        .iter()
+        .map(|counters| (counters.node.as_str(), counters.error.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            ("icmp4-input", "too-short"),
+            ("ip4-local", "bad-checksum"),
+            ("ip4-local", "bad-length"),
+        ],
+        "aliases are ordered by node and error, and the name without an error \
+         segment is skipped"
+    );
+
+    let bad_length = report
+        .error("ip4-local", "bad-length")
+        .expect("ip4-local publishes bad-length");
+    assert_eq!(bad_length.counts, [3, 4], "counts are in thread order");
+    assert_eq!(bad_length.total(), 7);
+    assert!(report.error("ip4-local", "bad-length-typo").is_none());
+    assert_eq!(report.node("ip4-local").count(), 2);
+    assert_eq!(
+        report.node("ip4-local").next().map(|c| c.error.as_str()),
+        Some("bad-checksum")
+    );
+    assert_eq!(report.node("absent").count(), 0);
+    // The zero count on the second thread of ip4-local/bad-checksum adds
+    // nothing to the total.
+    assert_eq!(report.total(), (3 + 4) + 1 + (9 + 9));
+}
+
+#[test]
+fn node_error_report_is_absent_without_an_alias() {
+    let directory = DirectoryFixture::new([
+        ("/sys/heartbeat", MetricValue::Scalar(7)),
+        ("/error/not-an-alias", MetricValue::Simple(vec![vec![7]])),
+        ("/err", MetricValue::Simple(vec![vec![7]])),
+    ]);
+    assert!(
+        NodeErrorStatsProvider::report(&directory)
+            .expect("the directory is readable")
+            .is_none(),
+        "no `/err/<node>/<error>` entry means the family does not exist"
+    );
+}
+
+/// A directory whose alias disappears between the listing and the read.
+struct VanishingAliasFixture;
+
+impl StatsReader for VanishingAliasFixture {
+    fn names(&self) -> Result<Vec<String>, Error> {
+        Ok(vec![
+            "/err/ip4-local/kept".to_owned(),
+            "/err/ip4-local/vanished".to_owned(),
+        ])
+    }
+
+    fn read(&self, name: &str) -> Result<MetricValue, Error> {
+        match name {
+            "/err/ip4-local/kept" => Ok(MetricValue::Simple(vec![vec![5], vec![6]])),
+            _ => Err(Error::MetricNotFound {
+                name: name.to_owned(),
+            }),
+        }
+    }
+}
+
+#[test]
+fn node_error_report_skips_an_alias_that_vanished() {
+    let report = NodeErrorStatsProvider::report(&VanishingAliasFixture)
+        .expect("a vanished alias is an ordinary absence")
+        .expect("the other alias keeps the family published");
+    assert_eq!(report.errors.len(), 1);
+    let kept = report
+        .error("ip4-local", "kept")
+        .expect("the kept alias is reported");
+    assert_eq!(kept.counts, [5, 6]);
+}
+
+#[test]
+fn node_error_report_rejects_an_alias_that_is_not_one_column_per_row() {
+    let directory = DirectoryFixture::new([(
+        "/err/ip4-local/bad-length",
+        MetricValue::Simple(vec![vec![1, 2]]),
+    )]);
+    let error = NodeErrorStatsProvider::report(&directory)
+        .expect_err("an alias selects exactly one column per row");
+    match error {
+        Error::UnexpectedColumnCount {
+            name,
+            expected,
+            actual,
+        } => {
+            assert_eq!(name, "/err/ip4-local/bad-length row 0");
+            assert_eq!(expected, 1);
+            assert_eq!(actual, 2);
+        }
+        other => panic!("expected a column-count error, got {other}"),
+    }
+}
+
+#[test]
+fn node_error_report_rejects_an_alias_that_is_not_a_counter_vector() {
+    let directory = DirectoryFixture::new([("/err/ip4-local/bad-length", MetricValue::Gauge(7))]);
+    let error = NodeErrorStatsProvider::report(&directory)
+        .expect_err("an alias is a simple counter vector");
+    match error {
+        Error::UnexpectedMetricType {
+            name,
+            expected,
+            actual,
+        } => {
+            assert_eq!(name, "/err/ip4-local/bad-length");
+            assert_eq!(expected, "counter_vector_simple");
+            assert_eq!(actual, "gauge");
         }
         other => panic!("expected a metric-type error, got {other}"),
     }
