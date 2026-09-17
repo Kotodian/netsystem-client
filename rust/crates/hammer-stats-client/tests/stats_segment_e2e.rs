@@ -11,8 +11,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hammer_stats_client::{
-    BufferPoolStatsProvider, Error, MemoryStatsProvider, MetricValue, StatsClient,
-    SystemStatsProvider,
+    BufferPoolStatsProvider, Error, MemoryStatsProvider, MetricValue, NodeCounter,
+    NodeStatsProvider, StatsClient, SystemStatsProvider,
 };
 
 const DAEMON_BINARY: &str = "HAMMER_DAEMON";
@@ -38,6 +38,12 @@ struct HammerDaemon {
 
 impl HammerDaemon {
     fn start(binary: &Path) -> Self {
+        Self::start_with_config(binary, "")
+    }
+
+    /// Starts a daemon whose `[statseg]` section also carries `statseg_extra`,
+    /// for example `per_node_counters = true`.
+    fn start_with_config(binary: &Path, statseg_extra: &str) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
@@ -55,7 +61,7 @@ impl HammerDaemon {
         fs::write(
             &config_path,
             format!(
-                "plugins = []\n\n[memory]\nmain_heap_size = \"256 MiB\"\n\n[worker]\ncount = {WORKER_COUNT}\n\n[statseg]\nsocket_name = \"{}\"\nupdate_interval = \"50ms\"\n\n[api-segment]\nprefix = \"{prefix}\"\n",
+                "plugins = []\n\n[memory]\nmain_heap_size = \"256 MiB\"\n\n[worker]\ncount = {WORKER_COUNT}\n\n[statseg]\nsocket_name = \"{}\"\nupdate_interval = \"50ms\"\n{statseg_extra}\n[api-segment]\nprefix = \"{prefix}\"\n",
                 stats_socket.display()
             ),
         )
@@ -411,6 +417,128 @@ fn stats_values_are_published_and_readable() {
         matches!(unknown_pool, Err(Error::MetricNotFound { .. })),
         "an unknown Pool is a typed error: {unknown_pool:?}"
     );
+
+    // `/sys/node/*` exists only while the server's per-node switch is on; with
+    // the switch off the family reads as absent, not as an error.
+    match client.report::<NodeStatsProvider>() {
+        Ok(report) => assert!(
+            report.is_none(),
+            "the node family is absent while the switch is off"
+        ),
+        Err(error) => panic!("an absent family is not an error: {error}"),
+    }
+
+    drop(client);
+    let status = daemon.shutdown();
+    assert!(
+        status.success(),
+        "{}",
+        daemon.diagnostics(format!("daemon exits unsuccessfully: {status:?}"))
+    );
+}
+
+/// Waits until the node-name vector and the counter shape are published
+/// completely, then returns the node names by slot.
+///
+/// The shape is published before the names, and both before the first collect
+/// round, so a client that attaches early sees a partly filled vector.
+fn published_node_names(client: &StatsClient, daemon: &mut HammerDaemon) -> Vec<String> {
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        let complete = match (
+            client.read("/sys/node/names"),
+            client.read("/sys/node/calls"),
+        ) {
+            (Ok(MetricValue::Names(names)), Ok(MetricValue::Simple(rows))) => {
+                !names.is_empty()
+                    && names.iter().all(|name| !name.is_empty())
+                    && rows.first().is_some_and(|row| row.len() == names.len())
+            }
+            _ => false,
+        };
+        if complete {
+            return match client.read("/sys/node/names") {
+                Ok(MetricValue::Names(names)) => names,
+                value => panic!("`/sys/node/names` is a name vector, got {value:?}"),
+            };
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            daemon.diagnostics("`/sys/node/names` is published with one name per node")
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[ignore = "requires HAMMER_DAEMON=/absolute/path/to/hammer"]
+fn node_stats_are_published_and_readable() {
+    let daemon_binary = std::env::var_os(DAEMON_BINARY)
+        .map(PathBuf::from)
+        .expect("HAMMER_DAEMON must name the Hammer daemon binary");
+    let mut daemon = HammerDaemon::start_with_config(&daemon_binary, "per_node_counters = true\n");
+    let client = daemon.stats_client();
+
+    let node_names = published_node_names(&client, &mut daemon);
+    let report = match client.report::<NodeStatsProvider>() {
+        Ok(Some(report)) => report,
+        Ok(None) => panic!(
+            "{}",
+            daemon.diagnostics("the node family is published while the switch is on")
+        ),
+        Err(error) => panic!("{}", daemon.diagnostics(error)),
+    };
+    assert_eq!(
+        report.names, node_names,
+        "the report carries the published names"
+    );
+    assert_eq!(
+        report.thread_count() as u64,
+        WORKER_COUNT + 1,
+        "thread zero plus the Data Workers"
+    );
+    for counter in [
+        NodeCounter::Clocks,
+        NodeCounter::Vectors,
+        NodeCounter::Calls,
+        NodeCounter::Suspends,
+    ] {
+        let rows = report.counter(counter);
+        assert_eq!(rows.len(), report.thread_count(), "{} rows", counter.name());
+        assert!(
+            rows.iter().all(|row| row.len() == node_names.len()),
+            "`{}` has one column per node",
+            counter.name()
+        );
+    }
+
+    // Every node has four aliases, and each selects that node's own column of
+    // the canonical entry it points at.
+    for (slot, name) in node_names.iter().enumerate() {
+        let node = report
+            .node(name)
+            .unwrap_or_else(|| panic!("`{name}` has one column"));
+        for counter in [
+            NodeCounter::Clocks,
+            NodeCounter::Vectors,
+            NodeCounter::Calls,
+            NodeCounter::Suspends,
+        ] {
+            let alias = format!("/nodes/{name}/{}", counter.name());
+            match client.read(&alias).expect("the alias is readable") {
+                MetricValue::Simple(rows) => {
+                    let selected: Vec<u64> = rows.iter().map(|row| row[0]).collect();
+                    assert_eq!(
+                        selected,
+                        node.counter(counter),
+                        "`{alias}` selects column {slot}"
+                    );
+                }
+                value => panic!("`{alias}` is a cropped counter vector, got {value:?}"),
+            }
+        }
+    }
 
     drop(client);
     let status = daemon.shutdown();
