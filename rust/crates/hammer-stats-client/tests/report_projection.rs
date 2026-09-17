@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use hammer_stats_client::{
-    Error, MemoryStatsProvider, MetricValue, StatsProvider, StatsReader, SystemStats,
-    SystemStatsProvider,
+    BufferPoolStatsProvider, Error, MemoryStatsProvider, MetricValue, StatsProvider, StatsReader,
+    SystemStats, SystemStatsProvider,
 };
 
 /// The family projections only need names and values, so the fixture is a map.
@@ -215,4 +215,99 @@ fn main_loop_rates_are_derived_from_cumulative_columns() {
         ..later.clone()
     };
     assert_eq!(backwards.main_loop_rates_per_second(&earlier), None);
+}
+
+/// Two Buffer Pools and their three gauges: the directory lists gauges only.
+fn buffer_pool_fixture() -> DirectoryFixture {
+    DirectoryFixture::new([
+        (
+            "/buffer-pools/default-numa-0/cached",
+            MetricValue::Gauge(64),
+        ),
+        ("/buffer-pools/default-numa-0/used", MetricValue::Gauge(100)),
+        (
+            "/buffer-pools/default-numa-0/available",
+            MetricValue::Gauge(3_932),
+        ),
+        ("/buffer-pools/default-numa-1/cached", MetricValue::Gauge(0)),
+        ("/buffer-pools/default-numa-1/used", MetricValue::Gauge(0)),
+        (
+            "/buffer-pools/default-numa-1/available",
+            MetricValue::Gauge(4_096),
+        ),
+    ])
+}
+
+#[test]
+fn buffer_pool_report_maps_the_three_gauges_of_every_pool() {
+    let directory = buffer_pool_fixture();
+    let report = BufferPoolStatsProvider::report(&directory).expect("fixture is well formed");
+    assert_eq!(report.pools.len(), 2, "one Pool per NUMA node");
+    let first = report.pool("default-numa-0").expect("node 0 is reported");
+    assert_eq!(first.cached, 64);
+    assert_eq!(first.used, 100);
+    assert_eq!(first.available, 3_932);
+    assert_eq!(
+        first.buffer_count(),
+        4_096,
+        "the three gauges add up to the Pool's buffer count"
+    );
+    let second = report.pool("default-numa-1").expect("node 1 is reported");
+    assert_eq!(second.buffer_count(), 4_096);
+    assert_eq!(
+        report
+            .pools
+            .iter()
+            .map(|pool| pool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["default-numa-0", "default-numa-1"],
+        "Pools are ordered by name"
+    );
+    assert!(report.pool("default-numa-2").is_none());
+    assert!(report.pool("default-numa-0/cached").is_none());
+}
+
+#[test]
+fn buffer_pool_report_rejects_a_missing_gauge() {
+    let directory = DirectoryFixture::new([
+        ("/buffer-pools/default-numa-0/cached", MetricValue::Gauge(1)),
+        ("/buffer-pools/default-numa-0/used", MetricValue::Gauge(2)),
+    ]);
+    let error =
+        BufferPoolStatsProvider::report(&directory).expect_err("a missing gauge is an error");
+    match error {
+        Error::MetricNotFound { name } => {
+            assert_eq!(name, "/buffer-pools/default-numa-0/available");
+        }
+        other => panic!("expected a missing-entry error, got {other}"),
+    }
+}
+
+#[test]
+fn buffer_pool_report_rejects_a_gauge_that_is_not_a_gauge() {
+    let directory = DirectoryFixture::new([
+        (
+            "/buffer-pools/default-numa-0/cached",
+            MetricValue::Simple(vec![vec![1]]),
+        ),
+        ("/buffer-pools/default-numa-0/used", MetricValue::Gauge(2)),
+        (
+            "/buffer-pools/default-numa-0/available",
+            MetricValue::Gauge(3),
+        ),
+    ]);
+    let error =
+        BufferPoolStatsProvider::report(&directory).expect_err("a counter vector is not a gauge");
+    match error {
+        Error::UnexpectedMetricType {
+            name,
+            expected,
+            actual,
+        } => {
+            assert_eq!(name, "/buffer-pools/default-numa-0/cached");
+            assert_eq!(expected, "gauge");
+            assert_eq!(actual, "counter_vector_simple");
+        }
+        other => panic!("expected a metric-type error, got {other}"),
+    }
 }

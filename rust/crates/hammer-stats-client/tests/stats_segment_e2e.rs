@@ -11,7 +11,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hammer_stats_client::{
-    Error, MemoryStatsProvider, MetricValue, StatsClient, SystemStatsProvider,
+    BufferPoolStatsProvider, Error, MemoryStatsProvider, MetricValue, StatsClient,
+    SystemStatsProvider,
 };
 
 const DAEMON_BINARY: &str = "HAMMER_DAEMON";
@@ -340,6 +341,75 @@ fn stats_values_are_published_and_readable() {
     assert!(
         matches!(missing, Err(Error::MetricNotFound { .. })),
         "an unknown name is a typed error: {missing:?}"
+    );
+
+    // `/buffer-pools/<pool>/{cached,used,available}`: one Pool per Data Worker
+    // NUMA node, three gauges each, and no bare `/buffer-pools/<pool>` entry.
+    let first_pools = match client.report::<BufferPoolStatsProvider>() {
+        Ok(report) => report,
+        Err(error) => panic!("{}", daemon.diagnostics(error)),
+    };
+    assert_eq!(
+        first_pools.pools.len(),
+        1,
+        "one Pool for the single Data Worker: {:?}",
+        first_pools.pools
+    );
+    let pool = &first_pools.pools[0];
+    assert!(
+        pool.name.starts_with("default-numa-"),
+        "a Pool is named after its NUMA node: {}",
+        pool.name
+    );
+    assert!(
+        pool.available > 0,
+        "`{}` keeps buffers on its free list: {pool:?}",
+        pool.name
+    );
+    assert!(
+        pool.buffer_count() > 0,
+        "`{}` published its three gauges: {pool:?}",
+        pool.name
+    );
+    match client
+        .read(&format!("/buffer-pools/{}/cached", pool.name))
+        .expect("the cached gauge is readable")
+    {
+        MetricValue::Gauge(value) => {
+            assert_eq!(value, pool.cached, "the report carries the gauge value");
+        }
+        value => panic!("`cached` is a gauge, got {value:?}"),
+    }
+    assert!(
+        matches!(
+            client.read(&format!("/buffer-pools/{}", pool.name)),
+            Err(Error::MetricNotFound { .. })
+        ),
+        "the directory publishes no bare Pool entry"
+    );
+
+    std::thread::sleep(SAMPLE_INTERVAL);
+    let second_pools = match client.report::<BufferPoolStatsProvider>() {
+        Ok(report) => report,
+        Err(error) => panic!("{}", daemon.diagnostics(error)),
+    };
+    assert_eq!(
+        second_pools.pools.len(),
+        1,
+        "the Pool set is fixed at startup: {:?}",
+        second_pools.pools
+    );
+    let second_pool = &second_pools.pools[0];
+    assert_eq!(second_pool.name, pool.name, "a Pool keeps its identity");
+    assert_eq!(
+        second_pool.buffer_count(),
+        pool.buffer_count(),
+        "the three gauges keep describing one buffer count: {pool:?} then {second_pool:?}"
+    );
+    let unknown_pool = client.read("/buffer-pools/not-a-pool/cached");
+    assert!(
+        matches!(unknown_pool, Err(Error::MetricNotFound { .. })),
+        "an unknown Pool is a typed error: {unknown_pool:?}"
     );
 
     drop(client);
