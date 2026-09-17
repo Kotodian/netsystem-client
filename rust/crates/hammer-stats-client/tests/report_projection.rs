@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use hammer_stats_client::{
-    BufferPoolStatsProvider, Error, MemoryStatsProvider, MetricValue, StatsProvider, StatsReader,
-    SystemStats, SystemStatsProvider,
+    BufferPoolStatsProvider, Error, MemoryStatsProvider, MetricValue, NodeCounter,
+    NodeStatsProvider, StatsProvider, StatsReader, SystemStats, SystemStatsProvider,
 };
 
 /// The family projections only need names and values, so the fixture is a map.
@@ -217,6 +217,179 @@ fn main_loop_rates_are_derived_from_cumulative_columns() {
     assert_eq!(backwards.main_loop_rates_per_second(&earlier), None);
 }
 
+/// Two Data Workers plus thread zero, two nodes, and the counters of the
+/// three-thread rows.
+fn node_fixture() -> DirectoryFixture {
+    DirectoryFixture::new([
+        (
+            "/sys/node/names",
+            MetricValue::Names(vec!["ip4-input".to_owned(), "session-queue".to_owned()]),
+        ),
+        (
+            "/sys/node/clocks",
+            MetricValue::Simple(vec![vec![0, 0], vec![900, 4_100], vec![700, 3_900]]),
+        ),
+        (
+            "/sys/node/vectors",
+            MetricValue::Simple(vec![vec![0, 0], vec![3, 7], vec![2, 9]]),
+        ),
+        (
+            "/sys/node/calls",
+            MetricValue::Simple(vec![vec![0, 0], vec![3, 7], vec![2, 9]]),
+        ),
+        (
+            "/sys/node/suspends",
+            MetricValue::Simple(vec![vec![5, 1], vec![0, 0], vec![0, 0]]),
+        ),
+        ("/sys/num_worker_threads", MetricValue::Gauge(2)),
+    ])
+}
+
+#[test]
+fn node_report_projects_one_column_per_node() {
+    let directory = node_fixture();
+    let report = NodeStatsProvider::report(&directory)
+        .expect("fixture is well formed")
+        .expect("the switch is on");
+    assert_eq!(report.names, ["ip4-input", "session-queue"]);
+    assert_eq!(
+        report.thread_count(),
+        3,
+        "thread zero plus two Data Workers"
+    );
+    assert_eq!(
+        report.counter(NodeCounter::Clocks),
+        [vec![0, 0], vec![900, 4_100], vec![700, 3_900]]
+    );
+    let node = report
+        .node("session-queue")
+        .expect("the second node exists");
+    assert_eq!(node.name, "session-queue");
+    assert_eq!(
+        node.clocks,
+        [0, 4_100, 3_900],
+        "the column follows the name"
+    );
+    assert_eq!(node.vectors, [0, 7, 9]);
+    assert_eq!(node.calls, [0, 7, 9]);
+    assert_eq!(node.suspends, [1, 0, 0], "only thread zero suspends");
+    assert_eq!(node.counter(NodeCounter::Calls), [0, 7, 9]);
+    assert!(report.node("not-a-node").is_none());
+}
+
+#[test]
+fn node_report_is_absent_when_the_family_is_not_published() {
+    let directory = DirectoryFixture::new([("/sys/num_worker_threads", MetricValue::Gauge(2))]);
+    let report = NodeStatsProvider::report(&directory).expect("an absent family is not an error");
+    assert!(
+        report.is_none(),
+        "the switch off means the family is absent"
+    );
+}
+
+#[test]
+fn node_report_rejects_a_column_count_that_disagrees_with_the_names() {
+    let directory = DirectoryFixture::new([
+        (
+            "/sys/node/names",
+            MetricValue::Names(vec!["ip4-input".to_owned(), "session-queue".to_owned()]),
+        ),
+        (
+            "/sys/node/clocks",
+            MetricValue::Simple(vec![vec![0], vec![900], vec![700]]),
+        ),
+        (
+            "/sys/node/vectors",
+            MetricValue::Simple(vec![vec![0, 0], vec![3, 7], vec![2, 9]]),
+        ),
+        (
+            "/sys/node/calls",
+            MetricValue::Simple(vec![vec![0, 0], vec![3, 7], vec![2, 9]]),
+        ),
+        (
+            "/sys/node/suspends",
+            MetricValue::Simple(vec![vec![0, 0], vec![0, 0], vec![0, 0]]),
+        ),
+        ("/sys/num_worker_threads", MetricValue::Gauge(2)),
+    ]);
+    let error = NodeStatsProvider::report(&directory)
+        .expect_err("a column count that disagrees with the names is an error");
+    match error {
+        Error::UnexpectedColumnCount {
+            name,
+            expected,
+            actual,
+        } => {
+            assert_eq!(name, "/sys/node/clocks row 0");
+            assert_eq!(expected, 2);
+            assert_eq!(actual, 1);
+        }
+        other => panic!("expected a column count error, got {other}"),
+    }
+}
+
+#[test]
+fn node_report_rejects_a_row_count_that_disagrees_with_the_worker_count() {
+    let directory = DirectoryFixture::new([
+        (
+            "/sys/node/names",
+            MetricValue::Names(vec!["ip4-input".to_owned()]),
+        ),
+        ("/sys/node/clocks", MetricValue::Simple(vec![vec![0]])),
+        ("/sys/node/vectors", MetricValue::Simple(vec![vec![0]])),
+        ("/sys/node/calls", MetricValue::Simple(vec![vec![0]])),
+        ("/sys/node/suspends", MetricValue::Simple(vec![vec![0]])),
+        ("/sys/num_worker_threads", MetricValue::Gauge(2)),
+    ]);
+    let error = NodeStatsProvider::report(&directory)
+        .expect_err("rows must be thread zero plus the Data Workers");
+    match error {
+        Error::WorkerCountMismatch {
+            name,
+            worker_thread_count,
+            columns,
+        } => {
+            assert_eq!(name, "/sys/node/clocks");
+            assert_eq!(worker_thread_count, 2);
+            assert_eq!(columns, 1);
+        }
+        other => panic!("expected a worker count error, got {other}"),
+    }
+}
+
+#[test]
+fn node_report_gives_an_ambiguous_name_no_single_column() {
+    let directory = DirectoryFixture::new([
+        (
+            "/sys/node/names",
+            MetricValue::Names(vec!["ip4-input".to_owned(), "ip4-input".to_owned()]),
+        ),
+        (
+            "/sys/node/clocks",
+            MetricValue::Simple(vec![vec![1, 2], vec![3, 4]]),
+        ),
+        (
+            "/sys/node/vectors",
+            MetricValue::Simple(vec![vec![1, 2], vec![3, 4]]),
+        ),
+        (
+            "/sys/node/calls",
+            MetricValue::Simple(vec![vec![1, 2], vec![3, 4]]),
+        ),
+        (
+            "/sys/node/suspends",
+            MetricValue::Simple(vec![vec![1, 2], vec![3, 4]]),
+        ),
+        ("/sys/num_worker_threads", MetricValue::Gauge(1)),
+    ]);
+    let report = NodeStatsProvider::report(&directory)
+        .expect("the shape is well formed")
+        .expect("the switch is on");
+    assert!(
+        report.node("ip4-input").is_none(),
+        "a duplicated name has no single column"
+    );
+}
 /// Two Buffer Pools and their three gauges: the directory lists gauges only.
 fn buffer_pool_fixture() -> DirectoryFixture {
     DirectoryFixture::new([
